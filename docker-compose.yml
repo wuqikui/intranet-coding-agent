@@ -1,0 +1,99 @@
+# ============================================================
+# 内网离线 AI Coding Agent 系统 - 一键部署
+# 用法: docker compose up -d
+# ============================================================
+version: "3.9"
+
+services:
+  # --- 前端 (React + Vite + AntD, nginx 托管构建产物) ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - intranet
+
+  # --- 后端 (FastAPI REST + SSE/WS) ---
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    env_file: .env
+    volumes:
+      - workspace-data:/app/data/workspace
+      - kb-data:/app/data/kb
+      - chroma-data:/app/data/chroma
+      - audit-data:/app/data/audit
+      - sqlite-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - intranet
+
+  # --- 推理引擎 (vLLM / llama.cpp / mock, 按 .env 切换) ---
+  inference:
+    build:
+      context: ./inference
+      dockerfile: Dockerfile
+    ports:
+      - "${INFERENCE_PORT:-8001}:8001"
+    env_file: .env
+    volumes:
+      # 离线模型库挂载 (只读)
+      - ${MODEL_REPO_PATH:-/models}:/models:ro
+      - inference-cache:/root/.cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - intranet
+
+  # --- 沙箱 (用户代码编译/运行环境) ---
+  sandbox:
+    build:
+      context: ./tools/sandbox
+      dockerfile: Dockerfile
+    volumes:
+      - workspace-data:/workspace
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    networks:
+      - intranet
+
+volumes:
+  workspace-data:
+  kb-data:
+  chroma-data:
+  audit-data:
+  sqlite-data:
+  inference-cache:
+
+networks:
+  intranet:
+    driver: bridge
+    internal: false  # 内网桥接; 出网由 maintenance mode 控制

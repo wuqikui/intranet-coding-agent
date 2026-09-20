@@ -1,0 +1,36 @@
+# --- Web 框架 ---
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+sse-starlette>=2.0.0
+python-multipart>=0.0.6
+
+# --- 配置与数据校验 ---
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# --- 数据库 ---
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+
+# --- 鉴权 ---
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+ldap3>=2.11.0
+
+# --- 推理网关 HTTP 客户端 ---
+httpx>=0.25.0
+
+# --- 知识库 ---
+chromadb>=0.4.18
+sentence-transformers>=2.2.0
+
+# --- Agent 编排 ---
+langgraph>=0.2.0
+langchain-core>=0.2.0
+
+# --- 工具 ---
+psutil>=5.9.0
+
+# --- 测试 ---
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
