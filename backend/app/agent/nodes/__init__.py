@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, Dict, List
 from app.agent.state import AgentState
 
 from .architect import architect_node
+from .explorer import explorer_node
 from .finalizer import finalizer_node
 from .generator import generator_node
 from .planner import plan_node
@@ -20,6 +21,7 @@ from .writer import writer_node
 __all__ = [
     "plan_node",
     "retriever_node",
+    "explorer_node",
     "architect_node",
     "generator_node",
     "writer_node",
@@ -33,6 +35,7 @@ __all__ = [
 NODE_ORDER: List[str] = [
     "planner",
     "retriever",
+    "explorer",
     "architect",
     "generator",
     "writer",
@@ -44,6 +47,7 @@ NODE_ORDER: List[str] = [
 NODES: Dict[str, Callable[[AgentState], Awaitable[Dict]]] = {
     "planner": plan_node,
     "retriever": retriever_node,
+    "explorer": explorer_node,
     "architect": architect_node,
     "generator": generator_node,
     "writer": writer_node,

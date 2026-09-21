@@ -35,6 +35,7 @@ class AgentState(TypedDict):
     # --- 检索 ---
     knowledge_context: Dict[str, Any]   # 前置检索结果
     code_style: Dict[str, Any]          # 代码风格规范
+    exploration: Dict[str, Any]         # agentic grep/glob/read 迭代探索结果
 
     # --- 生成 ---
     generated_files: Dict[str, str]     # path -> content
@@ -71,6 +72,7 @@ def initial_state(
         "file_tree": [],
         "knowledge_context": {},
         "code_style": {},
+        "exploration": {},
         "generated_files": {},
         "build_log": "",
         "fix_rounds": 0,

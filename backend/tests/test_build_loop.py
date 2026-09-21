@@ -326,6 +326,210 @@ def test_build_loop_log_contains_rounds_and_errors():
         print("[PASS] 工程循环日志完整: 含真实编译/轮次/错误")
 
 
+# ============================================================================
+# Python 工程循环：错误解析 + 自动修复 + 三段编译
+# ============================================================================
+
+
+def test_parse_python_syntax_error():
+    """解析 py_compile 的 traceback（File 行 + 异常行配对）。"""
+    parser = CompileErrorParser()
+    output = (
+        '  File "main.py", line 3\n'
+        "    def add(a, b)\n"
+        "                 ^\n"
+        "SyntaxError: expected ':'\n"
+    )
+    errors = parser.parse(output)
+    assert len(errors) == 1, errors
+    e = errors[0]
+    assert e.source == "python"
+    assert e.file == "main.py"
+    assert e.line == 3
+    assert e.code == "SyntaxError"
+    assert "expected" in e.message
+    print("[PASS] Python SyntaxError 解析: %s:%d %s" % (e.file, e.line, e.code))
+
+
+def test_parse_python_pytest_short_tb_combined_line():
+    """解析 --tb=line 格式："tests/x.py:5: AssertionError"（位置+异常同行）。"""
+    parser = CompileErrorParser()
+    output = '/path/tests/test_calc.py:5: AssertionError: assert 3 == 4\n'
+    errors = parser.parse(output)
+    assert len(errors) == 1, errors
+    e = errors[0]
+    assert e.source == "python"
+    assert e.file.endswith("test_calc.py")
+    assert e.line == 5
+    assert e.code == "AssertionError"
+    print("[PASS] pytest 单行格式解析: %s:%d" % (e.file, e.line))
+
+
+def test_parse_python_orphan_module_not_found():
+    """导入冒烟的 <string> traceback → file 置空（orphan），供 requirements 修复。"""
+    parser = CompileErrorParser()
+    output = (
+        "Traceback (most recent call last):\n"
+        '  File "<string>", line 1, in <module>\n'
+        "ModuleNotFoundError: No module named 'fakepkg_xyz'\n"
+    )
+    errors = parser.parse(output)
+    assert len(errors) == 1
+    e = errors[0]
+    assert e.source == "python"
+    assert e.file == "", "<string> 位置应置空"
+    assert e.code == "ModuleNotFoundError"
+    assert "fakepkg_xyz" in e.message
+    print("[PASS] ModuleNotFoundError orphan 解析: %s" % e.message)
+
+
+def test_fixer_python_missing_colon():
+    """P1: SyntaxError 漏冒号 → 行尾补冒号。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "main.py").write_text(
+            "def add(a, b)\n    return a + b\n", encoding="utf-8"
+        )
+        fixer = AutoFixer(root)
+        errors = [
+            CompileError(file="main.py", line=1, severity="error",
+                         message="invalid syntax", code="SyntaxError", source="python")
+        ]
+        actions = fixer.fix_errors(errors)
+        assert any(a.applied for a in actions), actions
+        new_content = (root / "main.py").read_text(encoding="utf-8")
+        assert new_content.split("\n")[0].endswith("add(a, b):"), new_content
+        print("[PASS] Python 补冒号: %s" % [a.description for a in actions if a.applied][0])
+
+
+def test_fixer_python_taberror():
+    """P2: TabError → 前导制表符转 4 空格。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "main.py").write_text(
+            "def f():\n\tx = 1\n\treturn x\n", encoding="utf-8"
+        )
+        fixer = AutoFixer(root)
+        errors = [
+            CompileError(file="main.py", line=2, severity="error",
+                         message="inconsistent use of tabs and spaces in indentation",
+                         code="TabError", source="python")
+        ]
+        actions = fixer.fix_errors(errors)
+        assert any(a.applied for a in actions)
+        new_content = (root / "main.py").read_text(encoding="utf-8")
+        assert "\t" not in new_content
+        assert "    x = 1" in new_content
+        print("[PASS] Python TabError 修复: tab → 4 空格")
+
+
+def test_fixer_python_missing_module_to_requirements():
+    """P3: ModuleNotFoundError → 第三方依赖写入 requirements.txt（幂等 + 白名单）。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "main.py").write_text("import fakepkg_xyz\n", encoding="utf-8")
+        fixer = AutoFixer(root)
+
+        def _err():
+            return CompileError(file="", line=0, severity="error",
+                                message="No module named 'fakepkg_xyz'",
+                                code="ModuleNotFoundError", source="python")
+
+        actions = fixer.fix_errors([_err()])
+        assert any(a.applied for a in actions)
+        req = (root / "requirements.txt").read_text(encoding="utf-8")
+        assert "fakepkg_xyz" in req
+
+        # 幂等：再次修复不重复写入
+        actions2 = fixer.fix_errors([_err()])
+        assert not any(a.applied for a in actions2), "第二次应跳过（已写入）"
+
+        # 标准库不写入
+        fixer2 = AutoFixer(root)
+        actions3 = fixer2.fix_errors([
+            CompileError(file="", message="No module named 'os'",
+                         code="ModuleNotFoundError", source="python")
+        ])
+        assert not any(a.applied for a in actions3), "os 是标准库不应写入"
+
+        # 项目本地模块不写入
+        (root / "mypkg.py").write_text("x = 1\n", encoding="utf-8")
+        fixer3 = AutoFixer(root)
+        actions4 = fixer3.fix_errors([
+            CompileError(file="", message="No module named 'mypkg'",
+                         code="ModuleNotFoundError", source="python")
+        ])
+        assert not any(a.applied for a in actions4), "本地模块不应写入"
+        print("[PASS] Python 缺依赖 → requirements.txt（幂等/stdlib/本地模块均正确跳过）")
+
+
+def test_build_loop_python_syntax_fix_roundtrip():
+    """端到端：语法错误的 Python 项目 → 工程循环自动修复 → 编译通过。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "main.py").write_text(
+            "def add(a, b)\n    return a + b\n\n\n"
+            "if __name__ == '__main__':\n    print('1+2=', add(1, 2))\n",
+            encoding="utf-8",
+        )
+        (root / "requirements.txt").write_text("# deps\n", encoding="utf-8")
+        reset_build_loop_for_test()
+        loop = BuildLoop()
+        import asyncio
+        result = asyncio.run(loop.run(root, ["main.py", "requirements.txt"]))
+        print("  status=%s rounds=%d fixes=%d" % (
+            result.status, result.rounds, len([f for f in result.fixes if f.applied])))
+        assert result.status == "passed", "修复后应通过，实际 %s" % result.status
+        assert any(f.applied for f in result.fixes), "应有修复动作"
+        new_content = (root / "main.py").read_text(encoding="utf-8")
+        assert "def add(a, b):" in new_content
+        print("[PASS] Python 工程循环闭环: 语法错误 → 自动修复 → passed")
+
+
+def test_build_loop_python_missing_dep_reports_failed():
+    """端到端：缺失第三方依赖 → 写 requirements 后仍无法安装 → failed（上报 LLM 修复）。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        pkg = "no_such_pkg_xyz123"
+        (root / "main.py").write_text(
+            "import %s\n\nprint('ok')\n" % pkg, encoding="utf-8"
+        )
+        reset_build_loop_for_test()
+        loop = BuildLoop()
+        import asyncio
+        result = asyncio.run(loop.run(root, ["main.py"]))
+        print("  status=%s rounds=%d fixes=%d errors=%d" % (
+            result.status, result.rounds,
+            len([f for f in result.fixes if f.applied]), len(result.errors)))
+        assert result.status == "failed", "离线装不了依赖应 failed，实际 %s" % result.status
+        req = (root / "requirements.txt").read_text(encoding="utf-8")
+        assert pkg in req, "依赖应已写入 requirements.txt"
+        print("[PASS] 缺依赖闭环: 写 requirements → 仍失败 → 交 LLM 轮处理")
+
+
+def test_build_loop_python_pytest_stage():
+    """端到端：带测试的 Python 项目 → 三段编译含 pytest → passed。"""
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "calc.py").write_text(
+            "def add(a, b):\n    return a + b\n", encoding="utf-8"
+        )
+        tdir = root / "tests"
+        tdir.mkdir()
+        (tdir / "test_calc.py").write_text(
+            "from calc import add\n\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+            encoding="utf-8",
+        )
+        reset_build_loop_for_test()
+        loop = BuildLoop()
+        import asyncio
+        result = asyncio.run(loop.run(root, ["calc.py", "tests/test_calc.py"]))
+        print("  status=%s rounds=%d" % (result.status, result.rounds))
+        assert result.status == "passed", result.build_log[-500:]
+        assert "pytest 通过" in result.build_log, "日志应记录 pytest 段"
+        print("[PASS] Python 三段编译: py_compile + 导入冒烟 + pytest 全部通过")
+
+
 if __name__ == "__main__":
     test_max_rounds_at_least_5()
     test_error_parser_gcc()
@@ -336,7 +540,16 @@ if __name__ == "__main__":
     test_fixer_adds_cstring()
     test_rule_scanner_cmake_visibility()
     test_rule_scanner_raw_new_delete()
+    test_parse_python_syntax_error()
+    test_parse_python_pytest_short_tb_combined_line()
+    test_parse_python_orphan_module_not_found()
+    test_fixer_python_missing_colon()
+    test_fixer_python_taberror()
+    test_fixer_python_missing_module_to_requirements()
     test_build_loop_python_passes()
+    test_build_loop_python_syntax_fix_roundtrip()
+    test_build_loop_python_missing_dep_reports_failed()
+    test_build_loop_python_pytest_stage()
     test_build_loop_cmake_tooling_missing_on_dev_machine()
     test_build_loop_unknown_project()
     test_build_loop_log_contains_rounds_and_errors()

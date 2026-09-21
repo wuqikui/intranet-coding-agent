@@ -43,16 +43,23 @@ async def generator_node(state: AgentState) -> Dict[str, Any]:
     fix_rounds = int(state.get("fix_rounds", 0)) + (1 if is_fix else 0)
 
     router = get_gateway_router()
+    exploration = state.get("exploration", {}) or {}
+    exp_summary = str(exploration.get("summary") or "").strip()
+    exp_part = ""
+    if exp_summary:
+        exp_part = "已有代码探索发现（复用其约定与符号）：%s\n" % exp_summary[:500]
     user_prompt = (
         "用户需求：%s\n语言：%s\n项目名：%s\n"
         "文件树：\n%s\n"
         "代码风格：%s\n"
+        "%s"
         % (
             user_query,
             primary_language or "python",
             project_name or "generated_project",
             "\n".join("- " + p for p in file_tree) or "- (无，请自行规划)",
             str(state.get("code_style", {})),
+            exp_part,
         )
     )
     if is_fix and build_log:

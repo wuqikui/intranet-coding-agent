@@ -4,7 +4,8 @@
 （FallbackGraph），保证管线在任何环境都能跑通。
 
 图结构：
-    planner → retriever → architect → generator → writer → runner
+    planner → retriever → explorer → architect → generator → writer → runner
+        └ explorer: agentic grep/glob/read 迭代探索（降级安全，绝不阻断）
         └ runner 失败且 fix_rounds<1 → 回 generator（LLM 修复重试 1 轮）
         └ 否则 → finalizer → END
 
@@ -54,6 +55,7 @@ def _build_langgraph():
     g = StateGraph(AgentState)
     g.add_node("planner", NODES["planner"])
     g.add_node("retriever", NODES["retriever"])
+    g.add_node("explorer", NODES["explorer"])
     g.add_node("architect", NODES["architect"])
     g.add_node("generator", NODES["generator"])
     g.add_node("writer", NODES["writer"])
@@ -61,7 +63,8 @@ def _build_langgraph():
     g.add_node("finalizer", NODES["finalizer"])
     g.set_entry_point("planner")
     g.add_edge("planner", "retriever")
-    g.add_edge("retriever", "architect")
+    g.add_edge("retriever", "explorer")
+    g.add_edge("explorer", "architect")
     g.add_edge("architect", "generator")
     g.add_edge("generator", "writer")
     g.add_edge("writer", "runner")
@@ -86,7 +89,7 @@ class FallbackGraph:
         """顺序执行全部节点，返回最终 state。"""
         state: Dict[str, Any] = dict(input_state)
         # 固定前序
-        for name in ("planner", "retriever", "architect"):
+        for name in ("planner", "retriever", "explorer", "architect"):
             state.update(await NODES[name](state))
         # generator → writer → runner，带单次修复重试
         for _ in range(2):  # 至多 2 轮（首次 + 1 次重试）
@@ -111,7 +114,7 @@ class FallbackGraph:
                 yield {"node": name, **m}
             prev_msg_count = len(msgs)
 
-        for name in ("planner", "retriever", "architect"):
+        for name in ("planner", "retriever", "explorer", "architect"):
             async for chunk in _run_node(name):
                 yield chunk
 

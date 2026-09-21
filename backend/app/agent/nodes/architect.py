@@ -29,10 +29,20 @@ async def architect_node(state: AgentState) -> Dict[str, Any]:
 
     router = get_gateway_router()
     kb_hint = state.get("knowledge_context", {}) or {}
+    exploration = state.get("exploration", {}) or {}
+    exp_summary = str(exploration.get("summary") or "").strip()
+    exp_files = list(exploration.get("files_read") or [])
+    exp_part = ""
+    if exp_summary or exp_files:
+        exp_part = (
+            "探索发现（agentic grep/glob/read）：\n"
+            "摘要：%s\n已精读文件：%s\n"
+        ) % (exp_summary or "(无)", ", ".join(exp_files[:10]) or "(无)")
     user_prompt = (
         "用户需求：%s\n"
         "语言：%s\n项目名：%s\n"
         "知识库命中(摘要)：code=%d buildops=%d dataapi=%d\n"
+        "%s"
         "请输出架构 JSON。"
     ) % (
         user_query,
@@ -41,6 +51,7 @@ async def architect_node(state: AgentState) -> Dict[str, Any]:
         len(kb_hint.get("code", []) or []),
         len(kb_hint.get("buildops", []) or []),
         len(kb_hint.get("dataapi", []) or []),
+        exp_part,
     )
     raw = await _common.call_llm(router, user_id, role, _SYSTEM, user_prompt, max_tokens=1024)
 

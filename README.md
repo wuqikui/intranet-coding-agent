@@ -50,7 +50,7 @@
 |---|---|---|
 | 代码生成 | 通用语言（模型会写即可） | Python、C/C++、Go、Rust、Java、JavaScript/TypeScript 等 |
 | 风格保真 | Python、C++、JavaScript、TypeScript、Go、Rust、Java 共 7 种有显式画像 | 未知语言回退默认；有知识库样本时以样本为准 |
-| 强制编译修复闭环 | **C/C++（CMake / Make）+ npm 前端** 深度支持 | Cargo(Rust) 可识别工程类型但错误修复规则未实现；Python/Go/Java 可生成、可运行，暂无专用编译修复规则 |
+| 强制编译修复闭环 | **C/C++（CMake / Make）+ Python（py_compile → 导入冒烟 → pytest 三段编译）+ npm 前端** | Python 支持补冒号/TabError/缺依赖写 requirements.txt 三条自动修复规则；Cargo(Rust) 可识别工程类型但错误修复规则未实现 |
 
 > 沙箱镜像本身预装了 gcc/g++/cmake/clang/clang-tidy/cppcheck、Python3、Node.js、Go 工具链。
 
@@ -70,9 +70,11 @@
 │  鉴权 RBAC │ 模型网关 │ 知识库 API │ 工具 API │ 向导 │ 审计        │
 │                                                                  │
 │  ┌─────────────────── Coding Agent 生成管线 ──────────────────┐  │
-│  │ planner → retriever → architect → generator → writer      │  │
-│  │                                   → runner  ⇄ generator   │  │
-│  │                                      ↓ 成功                │  │
+│  │ planner → retriever → explorer → architect → generator    │  │
+│  │                                → writer → runner  ⇄ gen   │  │
+│  │ explorer: agentic grep/glob/read 迭代探索（KB+工作区，    │  │
+│  │           最多 4 轮，降级安全不阻断）                       │  │
+│  │                                   ↓ 成功                    │  │
 │  │                                   finalizer               │  │
 │  │ （langgraph 不可用时自动降级为内置 FallbackGraph）          │  │
 │  └───────────────┬───────────────────────────┬───────────────┘  │
@@ -415,8 +417,12 @@ python backend/scripts/verify_audit_chain.py
 ### 工程循环（BuildLoop）
 
 ```
-cmake -B build → cmake --build build → 解析错误（gcc/clang/cmake/linker/MSVC 正则）
-     → AutoFixer 规则修复（缺 #include / 缺 std:: / 缺分号 / 缺 <cstring> …）
+C/C++:  cmake -B build → cmake --build build → 解析错误（gcc/clang/cmake/linker/MSVC 正则）
+Python: 三段编译 → py_compile 语法检查 → 顶层模块导入冒烟（抓缺依赖/导入期错误）
+        → pytest（存在测试且 pytest 可用时）→ 解析 traceback（File/line 配对）
+     → AutoFixer 规则修复：
+        C/C++: 缺 #include / 缺 std:: / 缺分号 / 缺 <cstring> / CMake 可见性
+        Python: 漏冒号(SyntaxError) / TabError 转 4 空格 / ModuleNotFoundError 写 requirements.txt
      → 重新编译，最多 N=5 轮
      → 仍失败则回 generator 做 1 轮 LLM 兜底修复，再跑 N 轮（合计最多 2N+1 轮）
 ```
@@ -453,7 +459,8 @@ python -m pytest tests/ -v
 |---|---|
 | `test_smoke_integration.py` | 35+ 端点冒烟（健康/鉴权/网关/知识库等） |
 | `test_acceptance.py` | 验收用例 AC-1/2/3/4/6/10：3 人并发无超时、全栈项目生成、RBAC 越权拒绝、离线可用、通道隔离、审计可查 |
-| `test_build_loop.py` | 工程循环、错误解析、AutoFixer、C++ 规则扫描 |
+| `test_build_loop.py` | 工程循环、错误解析、AutoFixer、C++ 规则扫描、Python 三段编译与修复闭环 |
+| `test_explorer.py` | agentic 探索器：grep/glob/read 工具、迭代循环、降级安全、管线注册 |
 | `test_style.py` | 风格检测/一致性检查/自动重写（18 个用例，含风格一致性评分阈值） |
 | `test_tools_rbac.py` | 危险命令 block/warn/safe、readonly 调 shell 返回 403、工具冒烟 |
 | `test_audit.py` | 哈希链生成与校验 |
@@ -481,7 +488,10 @@ python -m pytest tests/ -v
 ### v0.1 已实现并验证
 
 - 35+ 端点后端、React 管理/对话前端、4 容器 Compose 编排、离线镜像导入导出脚本
-- 7 节点生成管线（langgraph 缺失时自动降级）、C/C++ + npm 工程强制编译修复循环
+- 8 节点生成管线（planner→retriever→**explorer**→architect→generator→writer→runner→finalizer；langgraph 缺失时自动降级）
+  - **explorer**：agentic grep/glob/read 迭代探索（LLM 逐轮发起工具调用探索 KB 代码库与工作区，最多 4 轮，mock/异常自动降级不阻断）
+- C/C++ + Python + npm 工程强制编译修复循环
+  - Python 三段编译：py_compile → 顶层模块导入冒烟 → pytest；自动修复：补冒号 / TabError / 缺依赖写 requirements.txt
 - 四通道隔离知识库（符号图谱优先 + 向量兜底）、7 语言风格画像与自动重写
 - RBAC + JWT、哈希链审计、出网守卫 + sha256 导入、8 步首启向导
 - mock 推理后端下 3 人并发验收通过
@@ -489,8 +499,8 @@ python -m pytest tests/ -v
 ### 已知边界 / 后续完善（v0.2+ 候选）
 
 - **部署机验证**：Docker 镜像 build、GPU 直通、vLLM 实际加载大模型权重需在带先进显卡的台式机上现场验证。
-- **Agentic 代码探索**：当前知识库为"前置一次性检索"；计划让模型在生成过程中迭代调用 grep/glob/read 工具自主探索代码库（业界 coding agent 的主流做法），符号图谱作为快速定位入口。
-- **更多语言的工程循环**：为 Rust(cargo)、Go(go test/build)、Python(pytest)、Java(maven/gradle) 补齐错误解析与自动修复规则。
+- **更多语言的工程循环**：为 Rust(cargo)、Go(go test/build)、Java(maven/gradle) 补齐错误解析与自动修复规则。
+- **探索器增强**：探索轮次与工具覆盖率可视化；探索结果与符号图谱联动（先查符号再 read 精读）。
 - **LDAP/AD 真实域控联调**、>10 人规模压力测试。
 - 沙箱 docker 模式与生成管线在生产配置（SANDBOX_MODE=docker）下的端到端联调。
 

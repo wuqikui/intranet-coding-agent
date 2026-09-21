@@ -128,6 +128,22 @@ _MSVC_RE = re.compile(
     r"(?P<code>C\d+):\s*(?P<message>.*)$"
 )
 
+# Python traceback 位置行: File "main.py", line 3
+_PY_LOC_RE = re.compile(r'File "(?P<file>[^"]+)", line (?P<line>\d+)')
+
+# Python 异常行: SyntaxError: expected ':' / E   NameError: name 'x' is not defined
+_PY_EXC_RE = re.compile(
+    r"^(?:E\s+)?(?P<type>[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit))"
+    r"(?:\((?P<code>[^)]*)\))?:\s*(?P<message>.+)$"
+)
+
+# pytest --tb=line 单行格式: /path/tests/test_calc.py:5: AssertionError: assert 3 == 4
+_PY_COMBINED_RE = re.compile(
+    r"^(?P<file>[^:\s]+):(?P<line>\d+):\s*"
+    r"(?P<type>[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit))"
+    r"(?:\((?P<code>[^)]*)\))?:\s*(?P<message>.+)$"
+)
+
 
 class CompileErrorParser:
     """解析编译器/链接器/cmake 输出为结构化错误列表。"""
@@ -138,16 +154,38 @@ class CompileErrorParser:
         errors: List[CompileError] = []
         # 处理 \r\n / \r
         text = output.replace("\r\n", "\n").replace("\r", "\n")
+        # Python traceback 位置跟踪：File "x", line N 行与其后的异常行配对
+        py_loc: Tuple[str, int] = ("", 0)
         for raw_line in text.split("\n"):
             line = raw_line.rstrip()
             if not line:
                 continue
-            err = self._parse_line(line)
+            m_loc = _PY_LOC_RE.search(line)
+            if m_loc:
+                py_file, py_line = m_loc.group("file"), int(m_loc.group("line"))
+                rest = line[m_loc.end():].strip()
+                # pytest --tb=short 格式：同一行 "tests/x.py:5: AssertionError"
+                m_rest = _PY_EXC_RE.match(rest) if rest else None
+                if m_rest:
+                    errors.append(CompileError(
+                        file="" if py_file in ("<string>",) else py_file,
+                        line=0 if py_file in ("<string>",) else py_line,
+                        severity="warning" if m_rest.group("type").endswith("Warning") else "error",
+                        message=m_rest.group("message"),
+                        code=m_rest.group("type"),
+                        source="python",
+                    ))
+                    py_loc = ("", 0)
+                    continue
+                py_loc = (py_file, py_line)
+                continue
+            err = self._parse_line(line, py_loc)
             if err:
                 errors.append(err)
+                py_loc = ("", 0)  # 消费掉配对位置
         return errors
 
-    def _parse_line(self, line: str) -> Optional[CompileError]:
+    def _parse_line(self, line: str, py_loc: Tuple[str, int] = ("", 0)) -> Optional[CompileError]:
         # gcc/clang 优先（最常见）
         m = _GCC_ERR_RE.match(line)
         if m:
@@ -201,6 +239,35 @@ class CompileErrorParser:
                 code="undefined:%s" % m.group("symbol"),
                 source="linker",
             )
+        # Python 异常（traceback 配对 / pytest "E   XxxError:" 行）
+        m = _PY_EXC_RE.match(line)
+        if m:
+            exc_type = m.group("type")
+            file, lineno = py_loc
+            # import 冒烟检查的 traceback 位置是 <string>，无对应文件
+            if file in ("<string>", "<frozen importlib._bootstrap>"):
+                file, lineno = "", 0
+            return CompileError(
+                file=file,
+                line=lineno,
+                severity="warning" if exc_type.endswith("Warning") else "error",
+                message=m.group("message"),
+                code=exc_type,
+                source="python",
+            )
+        # pytest --tb=line 单行格式（file:line: ExcType: msg）
+        m = _PY_COMBINED_RE.match(line)
+        if m:
+            exc_type = m.group("type")
+            f = m.group("file")
+            return CompileError(
+                file="" if f in ("<string>",) else f,
+                line=int(m.group("line")),
+                severity="warning" if exc_type.endswith("Warning") else "error",
+                message=m.group("message"),
+                code=exc_type,
+                source="python",
+            )
         # 兜底：错误关键词
         low = line.lower()
         if "error:" in low or "fatal:" in low or "undefined" in low:
@@ -253,6 +320,39 @@ _STD_SYMBOL_INCLUDES: Dict[str, str] = {
 }
 
 
+# Python 标准库模块白名单（保守集合；缺这些的 ModuleNotFoundError 不写入 requirements）
+_PY_STDLIB_MODULES = {
+    "abc", "argparse", "array", "ast", "asyncio", "atexit", "base64", "binascii",
+    "bisect", "builtins", "calendar", "cmath", "collections", "concurrent",
+    "contextlib", "contextvars", "copy", "copyreg", "csv", "ctypes", "dataclasses",
+    "datetime", "decimal", "difflib", "dis", "doctest", "email", "enum", "errno",
+    "faulthandler", "fcntl", "filecmp", "fileinput", "fnmatch", "fractions",
+    "ftplib", "functools", "gc", "getopt", "getpass", "gettext", "glob", "graphlib",
+    "gzip", "hashlib", "heapq", "hmac", "html", "http", "importlib", "inspect",
+    "io", "ipaddress", "itertools", "json", "keyword", "linecache", "locale",
+    "logging", "lzma", "mailbox", "math", "mimetypes", "mmap", "multiprocessing",
+    "numbers", "operator", "os", "pathlib", "pdb", "pickle", "pickletools",
+    "pkgutil", "platform", "plistlib", "poplib", "posix", "pprint", "profile",
+    "pstats", "pty", "pwd", "py_compile", "pyclbr", "queue", "quopri", "random",
+    "re", "readline", "reprlib", "resource", "rlcompleter", "runpy", "sched",
+    "secrets", "select", "selectors", "shelve", "shlex", "shutil", "signal",
+    "site", "smtplib", "socket", "socketserver", "sqlite3", "ssl", "stat",
+    "statistics", "string", "stringprep", "struct", "subprocess", "symtable",
+    "sys", "sysconfig", "tarfile", "tempfile", "termios", "textwrap", "threading",
+    "time", "timeit", "traceback", "tracemalloc", "tty", "turtle", "types",
+    "typing", "unicodedata", "unittest", "urllib", "uuid", "venv", "warnings",
+    "wave", "weakref", "webbrowser", "wsgiref", "xml", "xmlrpc", "zipapp",
+    "zipfile", "zipimport", "zlib", "__future__", "typing_extensions",
+}
+
+
+# Python 编译/收集时跳过的目录
+_PY_SKIP_DIRS = {
+    "__pycache__", "build", "dist", "node_modules", "venv", ".venv",
+    ".git", ".pytest_cache", "htmlcov", "egg-info", ".tox", ".mypy_cache",
+}
+
+
 class AutoFixer:
     """基于错误模式的规则化自动修复。"""
 
@@ -283,7 +383,20 @@ class AutoFixer:
                         applied=False,
                     )
                 )
+
+        # 无文件归属的 Python 错误（import 冒烟 <string> traceback：如 ModuleNotFoundError）
+        for e in errors:
+            if getattr(e, "source", "") == "python" and not e.file:
+                try:
+                    actions.extend(self._fix_orphan_python(e))
+                except Exception as ex:
+                    logger.warning("修复 orphan python 错误失败: %s", ex)
         return actions
+
+    def _fix_orphan_python(self, err: CompileError) -> List[FixAction]:
+        """无文件归属的 Python 错误修复（当前仅缺依赖 → requirements.txt）。"""
+        action = self._ensure_requirement(err)
+        return [action] if action is not None else []
 
     def _fix_file(self, rel_path: str, errors: List[CompileError]) -> List[FixAction]:
         """修复单个文件，返回 FixAction 列表。"""
@@ -314,6 +427,10 @@ class AutoFixer:
 
     def _apply_one(self, content: str, err: CompileError, rel_path: str) -> Tuple[str, bool, str]:
         """尝试单个错误的修复规则。返回 (新内容, 是否应用, 描述)。"""
+        # Python 错误规则（source == "python"）
+        if err.source == "python":
+            return self._apply_python(content, err)
+
         msg = err.message or ""
 
         # 规则 1：缺 include（"was not declared in this scope" + std 符号）
@@ -383,6 +500,97 @@ class AutoFixer:
                 return new_content, True, "加 #include <cstring>"
 
         return content, False, ""
+
+    # ---- Python 修复规则 ----
+
+    def _apply_python(self, content: str, err: CompileError) -> Tuple[str, bool, str]:
+        """Python 错误的规则化修复。"""
+        code = err.code or ""
+        msg = err.message or ""
+        lines = content.split("\n")
+
+        # P1: SyntaxError 行尾补冒号
+        #   py3.10+: "expected ':'"；py3.9: "invalid syntax"（配合块语句行启发式）
+        if code == "SyntaxError" and err.line > 0:
+            idx = err.line - 1
+            if 0 <= idx < len(lines):
+                stripped = lines[idx].rstrip()
+                looks_block = re.match(
+                    r"^\s*(def|class|if|elif|else|for|while|with|try|except|finally)\b", stripped
+                )
+                want_colon = ("expected ':'" in msg) or bool(looks_block and "invalid syntax" in msg)
+                if want_colon and stripped and not stripped.endswith((":", "#", "\\", ",")) and "#" not in stripped:
+                    lines[idx] = stripped + ":"
+                    return "\n".join(lines), True, "在第 %d 行行尾补冒号（SyntaxError）" % err.line
+
+        # P2: TabError → 前导制表符转 4 空格
+        if code == "TabError" or "inconsistent use of tabs" in msg:
+            new_lines = []
+            changed = False
+            for ln in lines:
+                stripped = ln.lstrip("\t")
+                n_tabs = len(ln) - len(stripped)
+                if n_tabs > 0:
+                    new_lines.append("    " * n_tabs + stripped)
+                    changed = True
+                else:
+                    new_lines.append(ln)
+            if changed:
+                return "\n".join(new_lines), True, "前导制表符转 4 空格（TabError）"
+
+        # P3: ModuleNotFoundError → 依赖写入 requirements.txt
+        action = self._ensure_requirement(err)
+        if action is not None and action.applied:
+            return content, True, action.description
+
+        return content, False, ""
+
+    def _ensure_requirement(self, err: CompileError) -> Optional[FixAction]:
+        """ModuleNotFoundError → 把缺失的第三方模块追加到 requirements.txt。
+
+        跳过：标准库模块 / 项目内已有同名模块 / requirements.txt 已含该依赖。
+        """
+        if "No module named" not in (err.message or "") and err.code != "ModuleNotFoundError":
+            return None
+        m = re.search(r"No module named '(?P<name>[\w.]+)'", err.message or "")
+        if not m:
+            return None
+        top = m.group("name").split(".")[0]
+        # 标准库不写入
+        if top in _PY_STDLIB_MODULES:
+            return FixAction(file="requirements.txt", description="%s 是标准库，跳过" % top, applied=False)
+        # 项目内已有同名模块（本地包）不写入
+        try:
+            if (self.root / (top + ".py")).exists() or (self.root / top).is_dir():
+                return FixAction(file="requirements.txt", description="%s 是项目本地模块，跳过" % top, applied=False)
+        except Exception:
+            pass
+        # 幂等：已写入则跳过
+        req_path = self.root / "requirements.txt"
+        existing = ""
+        try:
+            if req_path.exists():
+                existing = req_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+        if re.search(r"(?m)^%s([=<>!\[]|$)" % re.escape(top), existing):
+            return FixAction(file="requirements.txt", description="%s 已在 requirements.txt，跳过" % top, applied=False)
+        # 追加
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            with req_path.open("a", encoding="utf-8") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                if not existing:
+                    f.write("# 由工程循环 AutoFixer 自动补充\n")
+                f.write(top + "\n")
+            return FixAction(
+                file="requirements.txt",
+                description="将缺失依赖 %s 追加到 requirements.txt（ModuleNotFoundError）" % top,
+                applied=True,
+            )
+        except Exception as e:
+            return FixAction(file="requirements.txt", description="写 requirements.txt 失败: %s" % e, applied=False)
 
     @staticmethod
     def _ensure_include(content: str, header: str) -> str:
@@ -711,23 +919,7 @@ class BuildLoop:
         if project_type == "make":
             return self.sandbox.run(str(project_root), ["make"], timeout=120)
         if project_type == "python":
-            # Python：跑 python -m py_compile 编译所有 .py
-            # 找出所有 .py
-            py_files = [str(p.relative_to(project_root)) for p in project_root.rglob("*.py")]
-            if not py_files:
-                return CommandResult(
-                    command=["python", "-m", "py_compile"],
-                    returncode=0,
-                    stdout="(no .py files)",
-                    stderr="",
-                    duration_ms=0,
-                    mode=self.sandbox.mode,
-                )
-            return self.sandbox.run(
-                str(project_root),
-                ["python", "-m", "py_compile"] + py_files,
-                timeout=60,
-            )
+            return self._compile_python(project_root)
         if project_type == "node":
             return self.sandbox.run(str(project_root), ["npm", "install"], timeout=180)
         # 其它类型：返回成功（占位）
@@ -739,6 +931,121 @@ class BuildLoop:
             duration_ms=0,
             mode=self.sandbox.mode,
         )
+
+    # ---- Python 三段编译 ----
+
+    def _py_files(self, project_root: Path) -> List[str]:
+        """收集项目下全部 .py（跳过虚拟环境/构建/隐藏目录）。"""
+        out: List[str] = []
+        try:
+            for p in sorted(project_root.rglob("*.py")):
+                rel = p.relative_to(project_root).as_posix()
+                parts = rel.split("/")
+                if any(
+                    seg in _PY_SKIP_DIRS or (seg.startswith(".") and seg not in (".",))
+                    for seg in parts[:-1]
+                ):
+                    continue
+                if p.name.startswith("."):
+                    continue
+                out.append(rel)
+        except Exception:
+            pass
+        return out
+
+    def _compile_python(self, project_root: Path) -> CommandResult:
+        """Python 三段编译：py_compile 语法检查 → 顶层模块导入冒烟 → pytest（如有测试）。
+
+        任一段失败即返回该段的 CommandResult（错误输出由 CompileErrorParser 解析，
+        ModuleNotFoundError 由 AutoFixer 写入 requirements.txt）。
+        """
+        mode = self.sandbox.mode
+        py_files = self._py_files(project_root)
+        notes: List[str] = []
+
+        if not py_files:
+            return CommandResult(
+                command=["python", "-m", "py_compile"], returncode=0,
+                stdout="(no .py files)", stderr="", duration_ms=0, mode=mode,
+            )
+
+        # 段 1：py_compile 全量语法检查
+        r = self.sandbox.run(
+            str(project_root), ["python", "-m", "py_compile"] + py_files, timeout=60
+        )
+        if r.tool_missing:
+            return r
+        if not r.ok:
+            return CommandResult(
+                command=r.command, returncode=r.returncode,
+                stdout="(stage 1/3 py_compile 语法检查失败)\n" + (r.stdout or ""),
+                stderr=r.stderr, duration_ms=r.duration_ms, mode=mode,
+            )
+        notes.append("(stage 1/3 py_compile: %d 个文件语法通过)" % len(py_files))
+
+        # 段 2：顶层模块导入冒烟（抓 ModuleNotFoundError / 导入期 NameError 等）
+        for rel in py_files:
+            if "/" in rel:
+                continue
+            name = rel[:-3]
+            if not name.isidentifier() or name.startswith("test") or name in ("setup", "conftest", "wsgi", "asgi"):
+                continue
+            r = self.sandbox.run(
+                str(project_root),
+                ["python", "-c", "import %s" % name],
+                timeout=30,
+            )
+            if r.tool_missing:
+                return r
+            if not r.ok:
+                return CommandResult(
+                    command=["python", "-c", "import %s" % name],
+                    returncode=r.returncode,
+                    stdout="(stage 2/3 导入冒烟失败: %s)\n%s" % (rel, r.stdout or ""),
+                    stderr=r.stderr, duration_ms=r.duration_ms, mode=mode,
+                )
+        notes.append("(stage 2/3 顶层模块导入冒烟通过: %d 个)" % sum(
+            1 for rel in py_files if "/" not in rel
+            and rel[:-3].isidentifier() and not rel[:-3].startswith("test")
+            and rel[:-3] not in ("setup", "conftest", "wsgi", "asgi")
+        ))
+
+        # 段 3：pytest（存在测试文件且 pytest 可用）
+        has_tests = any(
+            "/".join(rel.split("/")[:-1]) == "tests" or rel.split("/")[-1].startswith("test_") or rel.split("/")[-1].endswith("_test.py")
+            for rel in py_files
+        ) or (project_root / "tests").is_dir()
+        if not has_tests:
+            notes.append("(stage 3/3 pytest 跳过: 未发现测试)")
+        else:
+            r_ver = self.sandbox.run(
+                str(project_root), ["python", "-m", "pytest", "--version"], timeout=30
+            )
+            if r_ver.ok or "pytest" in (r_ver.stdout + r_ver.stderr).lower():
+                r = self.sandbox.run(
+                    str(project_root),
+                    ["python", "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider"],
+                    timeout=120,
+                )
+                if not r.ok:
+                    return CommandResult(
+                        command=r.command, returncode=r.returncode,
+                        stdout="(stage 3/3 pytest 失败)\n" + (r.stdout or ""),
+                        stderr=r.stderr, duration_ms=r.duration_ms, mode=mode,
+                    )
+                notes.append("(stage 3/3 pytest 通过)")
+            else:
+                notes.append("(stage 3/3 pytest 跳过: pytest 未安装)")
+
+        return CommandResult(
+            command=["python", "-m", "py_compile", "+ import-smoke", "+ pytest"],
+            returncode=0,
+            stdout="\n".join(notes) + "\n",
+            stderr="",
+            duration_ms=0,
+            mode=mode,
+        )
+
 
     # ---- Linter ----
 
